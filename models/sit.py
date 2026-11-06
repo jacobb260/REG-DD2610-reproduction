@@ -111,7 +111,7 @@ class SiTBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(
-            hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
+            hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs.get("qk_norm", False)
             )
         if "fused_attn" in block_kwargs.keys():
             self.attn.fused_attn = block_kwargs["fused_attn"]
@@ -174,7 +174,7 @@ class SiT(nn.Module):
         patch_size=2,
         in_channels=4,
         hidden_size=1152,
-        decoder_hidden_size=768,
+        decoder_hidden_size=None,
         encoder_depth=8,
         depth=28,
         num_heads=16,
@@ -185,9 +185,13 @@ class SiT(nn.Module):
         z_dims=[768],
         projector_dim=2048,
         cls_token_dim=768,
+        method='reg',
         **block_kwargs # fused_attn
     ):
         super().__init__()
+        if method not in {"sit", "repa", "reg"}:
+            raise ValueError(f"Unknown method: {method}")
+        self.method = method
         self.path_type = path_type
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -205,23 +209,30 @@ class SiT(nn.Module):
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches+1, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + (method == "reg"), hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
         ])
         self.projectors = nn.ModuleList([
-            build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
+            build_mlp(hidden_size, projector_dim, z_dim) for z_dim in (z_dims if method != "sit" else [])
             ])
 
         z_dim = self.z_dims[0]
         cls_token_dim = z_dim
+        decoder_hidden_size = hidden_size if decoder_hidden_size is None else decoder_hidden_size
+        if decoder_hidden_size != hidden_size:
+            raise ValueError("Final layer width must match transformer hidden_size")
         self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels, cls_token_dim)
 
 
         self.cls_projectors2 = nn.Linear(in_features=cls_token_dim, out_features=hidden_size, bias=True)
         self.wg_norm = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
 
+        if method != "reg":
+            del self.cls_projectors2
+            del self.wg_norm
+            del self.final_layer.linear_cls
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -235,7 +246,7 @@ class SiT(nn.Module):
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5), cls_token=1, extra_tokens=1
+            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5), cls_token=(self.method == "reg"), extra_tokens=int(self.method == "reg")
             )
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
@@ -261,8 +272,9 @@ class SiT(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
-        nn.init.constant_(self.final_layer.linear_cls.weight, 0)
-        nn.init.constant_(self.final_layer.linear_cls.bias, 0)
+        if self.method == "reg":
+            nn.init.constant_(self.final_layer.linear_cls.weight, 0)
+            nn.init.constant_(self.final_layer.linear_cls.bias, 0)
 
     def unpatchify(self, x, patch_size=None):
         """
@@ -289,14 +301,16 @@ class SiT(nn.Module):
 
         #cat with cls_token
         x = self.x_embedder(x)   # (N, T, D), where T = H * W / patch_size ** 2
-        if cls_token is not None:
+        if self.method == "reg":
+            if cls_token is None:
+                raise ValueError("REG requires a noisy CLS token")
             cls_token = self.cls_projectors2(cls_token)
             cls_token = self.wg_norm(cls_token)
             cls_token = cls_token.unsqueeze(1)  # [b, length, d]
             x = torch.cat((cls_token, x), dim=1)
-            x = x + self.pos_embed
         else:
-            exit()
+            cls_token = None
+        x = x + self.pos_embed
         N, T, D = x.shape
 
         # timestep and class embedding
@@ -304,6 +318,7 @@ class SiT(nn.Module):
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t_embed + y
 
+        zs = []
         for i, block in enumerate(self.blocks):
             x = block(x, c)
             if (i + 1) == self.encoder_depth:

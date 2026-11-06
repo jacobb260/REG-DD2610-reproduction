@@ -1,0 +1,7 @@
+# Install torch + torchvision for your hardware first (see SMALL_EXPERIMENT.md).
+timm==1.0.12
+diffusers==0.32.1
+numpy>=1.26,<3
+Pillow>=10
+safetensors>=0.4
+huggingface-hub>=0.27,<1

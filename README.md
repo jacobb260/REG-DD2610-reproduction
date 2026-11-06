@@ -154,3 +154,10 @@ Our code is based on [REPA](https://github.com/sihyun-yu/REPA), along with [SiT]
 
 
 
+
+## Small CIFAR-10 experiment (SiT-S/2)
+
+For a single-device comparison of SiT, REPA and REG on CIFAR-10 at 64×64,
+see [SMALL_EXPERIMENT.md](SMALL_EXPERIMENT.md). This uses cached VAE/DINOv2
+features and the separate `small_experiment.py` entry point. It is an adapted
+experiment, not an exact reproduction of the ImageNet results above.
