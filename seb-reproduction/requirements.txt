@@ -1,0 +1,11 @@
+jax[tpu]
+flax
+optax
+numpy
+torch
+torchvision
+timm
+tensorflow-datasets
+tensorflow
+Pillow
+tqdm
